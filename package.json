@@ -1,0 +1,48 @@
+{
+  "name": "@minnzen/sqliteq",
+  "version": "0.1.0",
+  "description": "Durable message queue backed by SQLite. Inspired by goqite.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "tsx bench/run.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minnzen/sqliteq.git"
+  },
+  "bugs": {
+    "url": "https://github.com/minnzen/sqliteq/issues"
+  },
+  "homepage": "https://github.com/minnzen/sqliteq#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "sqlite",
+    "queue",
+    "message-queue",
+    "durable",
+    "local-first",
+    "better-sqlite3"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "better-sqlite3": "^11.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
