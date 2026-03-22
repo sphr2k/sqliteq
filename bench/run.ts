@@ -8,16 +8,26 @@
  * Also verified with bun:sqlite (25/25 tests passing).
  */
 
-import Database from 'better-sqlite3'
-import { Queue } from '../src/index.js'
+import { Queue, BetterSqlite3Driver, BunSqliteDriver } from '../src/index.js'
 import { unlinkSync, existsSync } from 'fs'
+
+let Database: any
+let driverClass: any
+if (typeof process.versions.bun !== 'undefined') {
+  Database = (await import('bun:sqlite')).Database
+  driverClass = BunSqliteDriver
+} else {
+  Database = (await import('better-sqlite3')).default
+  driverClass = BetterSqlite3Driver
+}
 
 function freshDB(name: string) {
   const path = `/tmp/sqliteq-bench-${name}.db`
   for (const suffix of ['', '-wal', '-shm']) {
     if (existsSync(path + suffix)) unlinkSync(path + suffix)
   }
-  return { db: new Database(path), path }
+  const db = new Database(path)
+  return { db, path, driver: new driverClass(db) }
 }
 
 function cleanup(path: string) {
@@ -30,20 +40,22 @@ function fmt(n: number): string {
   return n.toLocaleString()
 }
 
-console.log('\n=== sqliteq benchmark (better-sqlite3) ===\n')
+const binding = typeof process.versions.bun !== 'undefined' ? 'bun:sqlite' : 'better-sqlite3'
+console.log(`\n=== sqliteq benchmark (${binding}) ===\n`)
 
 // 1. send → receive → delete cycle
 {
-  const { db, path } = freshDB('cycle')
-  const q = new Queue(db, 'bench', { timeout: 60_000 })
+  const { db, path, driver } = freshDB('cycle')
+  const q = new Queue(driver, 'bench', { timeout: 60_000 })
+  await q.init()
 
   const iterations = 10_000
   const start = performance.now()
 
   for (let i = 0; i < iterations; i++) {
-    q.send(`message-${i}`)
-    const msg = q.receive()
-    if (msg) q.delete(msg.id, msg.received)
+    await q.send(`message-${i}`)
+    const msg = await q.receive()
+    if (msg) await q.delete(msg.id, msg.received)
   }
 
   const elapsed = performance.now() - start
@@ -58,14 +70,15 @@ console.log('\n=== sqliteq benchmark (better-sqlite3) ===\n')
 
 // 2. send-only throughput
 {
-  const { db, path } = freshDB('send')
-  const q = new Queue(db, 'bench', { timeout: 60_000 })
+  const { db, path, driver } = freshDB('send')
+  const q = new Queue(driver, 'bench', { timeout: 60_000 })
+  await q.init()
 
   const iterations = 50_000
   const start = performance.now()
 
   for (let i = 0; i < iterations; i++) {
-    q.send(`message-${i}`)
+    await q.send(`message-${i}`)
   }
 
   const elapsed = performance.now() - start
@@ -79,24 +92,32 @@ console.log('\n=== sqliteq benchmark (better-sqlite3) ===\n')
 
 // 3. receive+delete on big table (100K messages, 10 queues)
 {
-  const { db, path } = freshDB('bigtable')
+  const { db, path, driver } = freshDB('bigtable')
   const queues: Queue[] = []
   for (let i = 0; i < 10; i++) {
-    queues.push(new Queue(db, `q${i}`, { timeout: 60_000 }))
+    queues.push(new Queue(driver, `q${i}`, { timeout: 60_000 }))
   }
+  await queues[0].init()
 
   console.log(`\nPopulating 100K messages across 10 queues...`)
   const populateStart = performance.now()
 
-  const pastTimeout = new Date(Date.now() - 1000).toISOString() // already available for receive
-  const insertStmt = db.prepare(
-    'insert into sqliteq (queue, body, timeout, priority) values (?, ?, ?, 0)'
-  )
-  db.transaction(() => {
-    for (let i = 0; i < 100_000; i++) {
-      insertStmt.run(`q${i % 10}`, JSON.stringify(`msg-${i}`), pastTimeout)
+  const pastTimeout = new Date(Date.now() - 1000).toISOString()
+  
+  // High-performance direct insertion using driver.batch
+  const batchSize = 1000
+  for (let i = 0; i < 100_000; i += batchSize) {
+    const sqls: string[] = []
+    // Note: Drivers currently don't support parameterized batching well for speed, 
+    // so we build raw SQL for the population phase of the benchmark.
+    const batchSql = []
+    for (let j = 0; j < batchSize; j++) {
+        const qIdx = (i + j) % 10
+        const body = JSON.stringify(`msg-${i+j}`)
+        batchSql.push(`insert into sqliteq (queue, body, timeout, priority) values ('q${qIdx}', '${body}', '${pastTimeout}', 0)`)
     }
-  })()
+    await driver.batch(batchSql)
+  }
 
   console.log(`  Populated in ${Math.round(performance.now() - populateStart)}ms`)
 
@@ -105,8 +126,8 @@ console.log('\n=== sqliteq benchmark (better-sqlite3) ===\n')
 
   for (let i = 0; i < iterations; i++) {
     const q = queues[i % 10]
-    const msg = q.receive()
-    if (msg) q.delete(msg.id, msg.received)
+    const msg = await q.receive()
+    if (msg) await q.delete(msg.id, msg.received)
   }
 
   const elapsed = performance.now() - start
@@ -121,8 +142,9 @@ console.log('\n=== sqliteq benchmark (better-sqlite3) ===\n')
 
 // 4. sendBatch throughput
 {
-  const { db, path } = freshDB('batch')
-  const q = new Queue(db, 'bench', { timeout: 60_000 })
+  const { db, path, driver } = freshDB('batch')
+  const q = new Queue(driver, 'bench', { timeout: 60_000 })
+  await q.init()
 
   const batchSize = 100
   const batches = 100
@@ -132,7 +154,7 @@ console.log('\n=== sqliteq benchmark (better-sqlite3) ===\n')
 
   const start = performance.now()
   for (let i = 0; i < batches; i++) {
-    q.sendBatch(messages)
+    await q.sendBatch(messages)
   }
   const elapsed = performance.now() - start
   const opsPerSec = Math.round(total / (elapsed / 1000))

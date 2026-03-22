@@ -12,6 +12,23 @@ export interface Database {
   transaction<R>(fn: (...args: unknown[]) => R): (...args: unknown[]) => R
 }
 
+/** Result of a driver execution */
+export interface DriverResultSet {
+  rows: any[]
+  rowsAffected: number
+  lastInsertRowid?: string | number
+}
+
+/** 
+ * Unified driver interface for different SQLite backends.
+ * Implementation can be synchronous or asynchronous.
+ */
+export interface QueueDriver {
+  execute(sql: string, args: any[]): Promise<DriverResultSet>
+  batch(sqls: string[]): Promise<void>
+  close?(): void
+}
+
 /** Opaque message identifier (format: `m_` + 32 hex chars). */
 export type ID = string
 

@@ -1,12 +1,4 @@
-import type {
-  Database,
-  ID,
-  Message,
-  QueueOptions,
-  QueueStats,
-  RequeueDeadLettersOptions,
-  SendOptions,
-} from './types.js'
+import type { ID, Message, SendOptions, QueueOptions, QueueDriver, QueueStats, RequeueDeadLettersOptions } from './types.js'
 
 const SCHEMA = `
 create table if not exists sqliteq (
@@ -18,15 +10,11 @@ create table if not exists sqliteq (
   received integer not null default 0,
   priority integer not null default 0
 ) strict;
-
-create index if not exists sqliteq_queue_priority_created_idx on sqliteq (queue, priority desc, created);
 `
 
-const SQL_SEND = `
-  insert into sqliteq (queue, body, timeout, priority)
-  values (?, ?, ?, ?)
-  returning id
-`
+const INDEX = `create index if not exists sqliteq_queue_priority_created_idx on sqliteq (queue, priority desc, created);`
+
+const SQL_SEND = `insert into sqliteq (queue, body, timeout, priority) values (?, ?, ?, ?) returning id`
 
 // Atomic claim: the subquery finds the next eligible message, the outer update
 // bumps its timeout + receive count in a single statement — no lock needed.
@@ -123,33 +111,19 @@ const DEFAULT_MAX_BODY_BYTES = 1_048_576 // 1MB
  * enforced by convention rather than at the type level.
  */
 export class Queue<T = string> {
-  private db: Database
+  private driver: QueueDriver
   private name: string
   /** Visibility timeout in ms. Exposed for Processor to read. */
   readonly timeout: number
   private maxReceive: number
   private maxBodyBytes: number
 
-  // Cached prepared statements — avoids re-parsing SQL on every call
-  private stmts: {
-    send: ReturnType<Database['prepare']>
-    receive: ReturnType<Database['prepare']>
-    extend: ReturnType<Database['prepare']>
-    delete: ReturnType<Database['prepare']>
-    size: ReturnType<Database['prepare']>
-    stats: ReturnType<Database['prepare']>
-    purge: ReturnType<Database['prepare']>
-    deadLetters: ReturnType<Database['prepare']>
-    deadLetterRows: ReturnType<Database['prepare']>
-    purgeDeadLetters: ReturnType<Database['prepare']>
-  }
-
-  constructor(db: Database, name: string, options?: QueueOptions) {
-    if (!db) throw new Error('db is required')
+  constructor(driver: QueueDriver, name: string, options?: QueueOptions) {
+    if (!driver) throw new Error('driver is required')
     if (!name) throw new Error('name is required')
     if (name.length > 255) throw new Error('name too long (max 255)')
 
-    this.db = db
+    this.driver = driver
     this.name = name
     this.timeout = options?.timeout ?? 5_000
     this.maxReceive = options?.maxReceive ?? 3
@@ -161,28 +135,20 @@ export class Queue<T = string> {
     if (this.timeout < 0) throw new Error('timeout cannot be negative')
     if (this.maxReceive < 1) throw new Error('maxReceive must be at least 1')
     if (this.maxBodyBytes < 1) throw new Error('maxBodyBytes must be at least 1')
+  }
 
+  /**
+   * Initialize the queue schema. This is idempotent and can be called safely
+   * multiple times or across different queues sharing the same database.
+   */
+  async init(): Promise<void> {
     try {
-      db.exec('pragma journal_mode = WAL')
-      db.exec('pragma busy_timeout = 5000')
+      await this.driver.execute('pragma journal_mode = WAL', [])
+      await this.driver.execute('pragma busy_timeout = 5000', [])
     } catch {
-      // Some DB wrappers may not support exec for pragmas — non-fatal
+      // Some drivers may not support pragmas — non-fatal
     }
-
-    db.exec(SCHEMA)
-
-    this.stmts = {
-      send: db.prepare(SQL_SEND),
-      receive: db.prepare(SQL_RECEIVE),
-      extend: db.prepare(SQL_EXTEND),
-      delete: db.prepare(SQL_DELETE),
-      size: db.prepare(SQL_SIZE),
-      stats: db.prepare(SQL_STATS),
-      purge: db.prepare(SQL_PURGE),
-      deadLetters: db.prepare(SQL_DEAD_LETTERS),
-      deadLetterRows: db.prepare(SQL_DEAD_LETTER_ROWS),
-      purgeDeadLetters: db.prepare(SQL_PURGE_DEAD_LETTERS),
-    }
+    await this.driver.batch([SCHEMA, INDEX])
   }
 
   /**
@@ -191,7 +157,7 @@ export class Queue<T = string> {
    * Body is JSON-serialized. T must be JSON-round-trippable.
    * Date, Map, Set, and other non-POJO types will not survive serialization.
    */
-  send(body: T, options?: SendOptions): ID {
+  async send(body: T, options?: SendOptions): Promise<ID> {
     if (body === undefined) throw new Error('body cannot be undefined')
 
     const delay = options?.delay ?? 0
@@ -212,9 +178,9 @@ export class Queue<T = string> {
       throw new Error(`body exceeds max size (${this.maxBodyBytes} bytes)`)
     }
 
-    const row = this.stmts.send.get(this.name, serialized, timeout, priority) as { id: string } | undefined
-    if (!row) throw new Error('failed to insert message')
-    return row.id
+    const res = await this.driver.execute(SQL_SEND, [this.name, serialized, timeout, priority])
+    if (res.rows.length === 0) throw new Error('failed to insert message')
+    return res.rows[0].id as string
   }
 
   /**
@@ -222,10 +188,33 @@ export class Queue<T = string> {
    * If any message fails validation, the entire batch is rolled back.
    * @returns An array of message IDs in the same order as the input.
    */
-  sendBatch(messages: Array<{ body: T; options?: SendOptions }>): ID[] {
-    return this.db.transaction(() =>
-      messages.map((m) => this.send(m.body, m.options))
-    )()
+  async sendBatch(messages: Array<{ body: T; options?: SendOptions }>): Promise<ID[]> {
+    const ids: ID[] = []
+    const sqls: string[] = []
+    const args: any[][] = []
+
+    for (const m of messages) {
+      if (m.body === undefined) throw new Error('body cannot be undefined')
+      const delay = m.options?.delay ?? 0
+      const priority = m.options?.priority ?? 0
+      validateFinite(delay, 'delay')
+      validateFinite(priority, 'priority')
+      if (delay < 0) throw new Error('delay cannot be negative')
+
+      const timeout = nowPlusMs(delay)
+      const serialized = JSON.stringify(m.body)
+      if (serialized === undefined) throw new Error('body is not JSON-serializable')
+      if (Buffer.byteLength(serialized, 'utf8') > this.maxBodyBytes) throw new Error(`body exceeds max size`)
+
+      sqls.push(SQL_SEND)
+      args.push([this.name, serialized, timeout, priority])
+    }
+
+    for (let i = 0; i < sqls.length; i++) {
+      const res = await this.driver.execute(sqls[i], args[i])
+      ids.push(res.rows[0].id)
+    }
+    return ids
   }
 
   /**
@@ -233,15 +222,13 @@ export class Queue<T = string> {
    * The message becomes invisible to other consumers for `timeout` ms.
    * @returns The message, or `null` if the queue is empty or all messages are in-flight.
    */
-  receive(): Message<T> | null {
+  async receive(): Promise<Message<T> | null> {
     const now = new Date().toISOString()
     const timeout = nowPlusMs(this.timeout)
 
-    const row = this.stmts.receive.get(timeout, this.name, now, this.maxReceive) as
-      | { id: string; body: string; received: number }
-      | undefined
-
-    if (!row) return null
+    const res = await this.driver.execute(SQL_RECEIVE, [timeout, this.name, now, this.maxReceive])
+    if (res.rows.length === 0) return null
+    const row = res.rows[0]
 
     return { id: row.id, body: parseMessageBody<T>(row.body, row.id), received: row.received }
   }
@@ -250,18 +237,15 @@ export class Queue<T = string> {
    * Atomically claim up to `limit` available messages.
    * Returns fewer than requested when the queue runs dry.
    */
-  receiveBatch(limit: number): Message<T>[] {
+  async receiveBatch(limit: number): Promise<Message<T>[]> {
     validatePositiveInteger(limit, 'limit')
-
-    return this.db.transaction(() => {
-      const messages: Message<T>[] = []
-      for (let i = 0; i < limit; i++) {
-        const msg = this.receive()
-        if (!msg) break
-        messages.push(msg)
-      }
-      return messages
-    })()
+    const messages: Message<T>[] = []
+    for (let i = 0; i < limit; i++) {
+      const msg = await this.receive()
+      if (!msg) break
+      messages.push(msg)
+    }
+    return messages
   }
 
   /**
@@ -271,12 +255,12 @@ export class Queue<T = string> {
    * @param delay - Additional visibility time in ms.
    * @returns `true` if extended, `false` if the message was already re-delivered (stale handle).
    */
-  extend(id: ID, received: number, delay: number): boolean {
+  async extend(id: ID, received: number, delay: number): Promise<boolean> {
     validateFinite(delay, 'delay')
     if (delay < 0) throw new Error('delay cannot be negative')
     const timeout = nowPlusMs(delay)
-    const result = this.stmts.extend.run(timeout, this.name, id, received)
-    return result.changes > 0
+    const res = await this.driver.execute(SQL_EXTEND, [timeout, this.name, id, received])
+    return res.rowsAffected > 0
   }
 
   /**
@@ -285,32 +269,26 @@ export class Queue<T = string> {
    * @param received - Receive count from {@link Message.received} (used as a fencing token).
    * @returns `true` if deleted, `false` if the message was already re-delivered (stale handle — safe no-op).
    */
-  delete(id: ID, received: number): boolean {
-    const result = this.stmts.delete.run(this.name, id, received)
-    return result.changes > 0
+  async delete(id: ID, received: number): Promise<boolean> {
+    const res = await this.driver.execute(SQL_DELETE, [this.name, id, received])
+    return res.rowsAffected > 0
   }
 
   /** Number of messages in this queue (all states). */
-  size(): number {
-    const row = this.stmts.size.get(this.name) as { c: number }
-    return row.c
+  async size(): Promise<number> {
+    const res = await this.driver.execute(SQL_SIZE, [this.name])
+    return Number(res.rows[0].c)
   }
 
   /** Queue counts grouped by operational state. */
-  stats(): QueueStats {
+  async stats(): Promise<QueueStats> {
     const now = new Date().toISOString()
-    const row = this.stmts.stats.get(
-      this.maxReceive,
-      now,
-      now,
-      now,
-      this.maxReceive,
-      now,
-      this.name,
-    ) as
+    const res = await this.driver.execute(SQL_STATS, [
+      this.maxReceive, now, now, now, this.maxReceive, now, this.name,
+    ])
+    const row = res.rows[0] as
       | { total: number; ready: number | null; delayed: number | null; in_flight: number | null; dead: number | null }
       | undefined
-
     return {
       total: row?.total ?? 0,
       ready: row?.ready ?? 0,
@@ -321,8 +299,9 @@ export class Queue<T = string> {
   }
 
   /** Remove all messages from this queue. @returns Count of messages deleted. */
-  purge(): number {
-    return this.stmts.purge.run(this.name).changes
+  async purge(): Promise<number> {
+    const res = await this.driver.execute(SQL_PURGE, [this.name])
+    return res.rowsAffected
   }
 
   /**
@@ -330,44 +309,41 @@ export class Queue<T = string> {
    * Requeued messages get new IDs so stale handles from previous deliveries remain invalid.
    * @returns The new message IDs in FIFO order.
    */
-  requeueDeadLetters(options?: RequeueDeadLettersOptions): ID[] {
+  async requeueDeadLetters(options?: RequeueDeadLettersOptions): Promise<ID[]> {
     const delay = options?.delay ?? 0
     validateFinite(delay, 'delay')
     if (delay < 0) throw new Error('delay cannot be negative')
 
-    return this.db.transaction(() => {
-      const now = new Date().toISOString()
-      const timeout = nowPlusMs(delay)
-      const rows = this.stmts.deadLetterRows.all(this.name, this.maxReceive, now) as
-        Array<{ id: string; body: string; received: number; priority: number }>
+    const now = new Date().toISOString()
+    const timeout = nowPlusMs(delay)
+    const res = await this.driver.execute(SQL_DEAD_LETTER_ROWS, [this.name, this.maxReceive, now])
+    const rows = res.rows as Array<{ id: string; body: string; received: number; priority: number }>
 
-      const ids: ID[] = []
-      for (const row of rows) {
-        const inserted = this.stmts.send.get(this.name, row.body, timeout, row.priority) as { id: string } | undefined
-        if (!inserted) throw new Error(`failed to requeue dead letter ${row.id}`)
-        ids.push(inserted.id)
+    const ids: ID[] = []
+    for (const row of rows) {
+      const inserted = await this.driver.execute(SQL_SEND, [this.name, row.body, timeout, row.priority])
+      if (inserted.rows.length === 0) throw new Error(`failed to requeue dead letter ${row.id}`)
+      ids.push(inserted.rows[0].id)
 
-        const deleted = this.stmts.delete.run(this.name, row.id, row.received)
-        if (deleted.changes !== 1) throw new Error(`failed to delete dead letter ${row.id} after requeue`)
-      }
-
-      return ids
-    })()
+      const deleted = await this.driver.execute(SQL_DELETE, [this.name, row.id, row.received])
+      if (deleted.rowsAffected !== 1) throw new Error(`failed to delete dead letter ${row.id} after requeue`)
+    }
+    return ids
   }
 
   /** Remove all currently dead-lettered messages. @returns Count of messages deleted. */
-  purgeDeadLetters(): number {
+  async purgeDeadLetters(): Promise<number> {
     const now = new Date().toISOString()
-    return this.stmts.purgeDeadLetters.run(this.name, this.maxReceive, now).changes
+    const res = await this.driver.execute(SQL_PURGE_DEAD_LETTERS, [this.name, this.maxReceive, now])
+    return res.rowsAffected
   }
 
   /** Get messages that exceeded `maxReceive` and will never be delivered again. Inspect or purge these periodically. */
-  deadLetters(): Message<T>[] {
+  async deadLetters(): Promise<Message<T>[]> {
     const now = new Date().toISOString()
-    const rows = this.stmts.deadLetters.all(this.name, this.maxReceive, now) as
-      Array<{ id: string; body: string; received: number }>
-
-    return rows.map((r) => {
+    const res = await this.driver.execute(SQL_DEAD_LETTERS, [this.name, this.maxReceive, now])
+    
+    return res.rows.map((r) => {
       let body: T
       try {
         body = parseMessageBody<T>(r.body, r.id)

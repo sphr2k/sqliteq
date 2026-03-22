@@ -1,5 +1,15 @@
-import type { Message } from './types.js'
-import type { Queue } from './queue.js'
+import type { Message, ID } from './types.js'
+
+/** 
+ * Interface for both synchronous and asynchronous queue implementations.
+ * This allows the Processor to work with better-sqlite3, bun:sqlite, and LibSQL/Turso.
+ */
+export interface IQueue<T> {
+  readonly timeout: number
+  receive(): Promise<Message<T> | null>
+  extend(id: ID, received: number, delay: number): Promise<boolean>
+  delete(id: ID, received: number): Promise<boolean>
+}
 
 export interface ProcessorOptions<T> {
   /** Handler function. Return normally = auto-delete. Throw = leave for retry. */
@@ -31,8 +41,11 @@ function safeOnError(
   }
 }
 
+/**
+ * Long-running consumer that polls, processes, and auto-deletes messages.
+ */
 export class Processor<T = string> {
-  private queue: Queue<T>
+  private queue: IQueue<T>
   private handler: (msg: Message<T>) => void | Promise<void>
   private pollInterval: number
   private concurrency: number
@@ -46,7 +59,7 @@ export class Processor<T = string> {
   private stopPromise: Promise<void> | null = null
   private stopResolve: (() => void) | null = null
 
-  constructor(queue: Queue<T>, options: ProcessorOptions<T>) {
+  constructor(queue: IQueue<T>, options: ProcessorOptions<T>) {
     this.queue = queue
     this.handler = options.handler
     this.pollInterval = options.pollInterval ?? 100
@@ -94,14 +107,14 @@ export class Processor<T = string> {
     return this.stopPromise
   }
 
-  private poll(): void {
+  private async poll(): Promise<void> {
     if (!this.running) return
 
     // Iterative loop to fill concurrency slots (avoids recursive stack overflow)
     while (this.running && this.activeCount < this.concurrency) {
       let msg: Message<T> | null
       try {
-        msg = this.queue.receive()
+        msg = await this.queue.receive()
       } catch (err) {
         safeOnError(this.onError, err, { phase: 'receive', messageId: '' })
         break
@@ -126,13 +139,15 @@ export class Processor<T = string> {
     let extendTimer: ReturnType<typeof setInterval> | null = null
     if (this.extendMs > 0) {
       const extendDelay = Math.max(1, this.extendMs - Math.floor(this.extendMs / 5))
-      extendTimer = setInterval(() => {
+      extendTimer = setInterval(async () => {
         try {
-          const ok = this.queue.extend(msg.id, msg.received, this.extendMs)
+          const ok = await this.queue.extend(msg.id, msg.received, this.extendMs)
           if (!ok) {
             // Message was redelivered to another consumer — stop extending
-            clearInterval(extendTimer!)
-            extendTimer = null
+            if (extendTimer) {
+              clearInterval(extendTimer)
+              extendTimer = null
+            }
             safeOnError(this.onError, new Error('extend failed: message was redelivered (stale handle)'), { phase: 'extend', messageId: msg.id })
           }
         } catch (err) {
@@ -148,13 +163,16 @@ export class Processor<T = string> {
     } catch (err) {
       safeOnError(this.onError, err, { phase: 'handler', messageId: msg.id })
     } finally {
-      if (extendTimer) clearInterval(extendTimer)
+      if (extendTimer) {
+        clearInterval(extendTimer)
+        extendTimer = null
+      }
     }
 
     // Only delete on success — a failed handler leaves the message for retry after timeout
     if (handlerSucceeded) {
       try {
-        const ok = this.queue.delete(msg.id, msg.received)
+        const ok = await this.queue.delete(msg.id, msg.received)
         if (!ok) {
           safeOnError(this.onError, new Error('delete failed: message was redelivered (stale handle)'), { phase: 'delete', messageId: msg.id })
         }

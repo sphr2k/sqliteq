@@ -10,30 +10,54 @@ Inspired by [goqite](https://github.com/maragudk/goqite). Zero dependencies.
 npm install @minnzen/sqliteq better-sqlite3
 ```
 
-sqliteq has zero runtime dependencies. You provide the SQLite binding —
-[better-sqlite3](https://github.com/WiseLibs/better-sqlite3) is recommended.
-Bun users can use the built-in `bun:sqlite` instead.
+sqliteq uses an adapter pattern to support different SQLite backends with a unified asynchronous API.
 
 ## Usage
 
+### 1. Choose a Driver
+
+| Runtime | Backend | Driver |
+|---|---|---|
+| Node.js | better-sqlite3 | `BetterSqlite3Driver` |
+| Bun | bun:sqlite | `BunSqliteDriver` |
+| Remote/Distributed | LibSQL / Turso | `LibsqlDriver` |
+
+### 2. Implementation
+
 ```ts
+import { Queue, BetterSqlite3Driver } from '@minnzen/sqliteq'
 import Database from 'better-sqlite3'
-import { Queue } from '@minnzen/sqliteq'
 
 const db = new Database('app.db')
-const q = new Queue(db, 'emails')
+const q = new Queue(new BetterSqlite3Driver(db), 'emails')
 
-q.send({ to: 'user@example.com', subject: 'Hello' })
+// Initialize schema (first time only)
+await q.init()
 
-const msg = q.receive()
+await q.send({ to: 'user@example.com', subject: 'Hello' })
+
+const msg = await q.receive()
 if (msg) {
-  console.log(msg.body) // { to: 'user@example.com', subject: 'Hello' }
-  q.delete(msg.id, msg.received)
+  console.log(msg.body)
+  await q.delete(msg.id, msg.received)
 }
 ```
 
-The table and indexes are created automatically on first use. WAL mode is
-enabled by default.
+### Turso / LibSQL
+
+```ts
+import { createClient } from '@libsql/client'
+import { Queue, LibsqlDriver } from '@minnzen/sqliteq'
+
+const client = createClient({ url: 'libsql://...', authToken: '...' })
+const q = new Queue(new LibsqlDriver(client), 'jobs')
+
+await q.init()
+await q.send({ task: 'process' })
+```
+
+The `Queue` class is now fully asynchronous for all backends, ensuring a
+consistent interface whether you're using a local file or a remote Turso DB.
 
 ## Features
 

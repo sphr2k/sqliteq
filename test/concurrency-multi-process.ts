@@ -11,6 +11,7 @@ import { fork, type ChildProcess } from 'node:child_process'
 import { unlinkSync, existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { Queue, BetterSqlite3Driver, BunSqliteDriver } from '../src/index.js'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -24,15 +25,23 @@ const TIMEOUT_MS = 15_000 // overall test timeout
 // Worker mode — when this script is forked with --worker flag
 // ---------------------------------------------------------------------------
 if (process.argv.includes('--worker')) {
-  const Database = (await import('better-sqlite3')).default
-  const { Queue } = await import('../src/index.js')
+  let Database: any
+  let driverClass: any
+  if (typeof process.versions.bun !== 'undefined') {
+    Database = (await import('bun:sqlite')).Database
+    driverClass = BunSqliteDriver
+  } else {
+    Database = (await import('better-sqlite3')).default
+    driverClass = BetterSqlite3Driver
+  }
 
   const dbPath = process.argv[process.argv.indexOf('--db') + 1]
   const db = new Database(dbPath)
-  const q = new Queue<number>(db, 'bench', {
+  const q = new Queue<number>(new driverClass(db), 'bench', {
     timeout: 30_000, // long visibility so no accidental re-delivery
     maxReceive: 5,
   })
+  await q.init()
 
   // Signal ready and wait for "go" from parent
   process.send!({ type: 'ready' })
@@ -51,20 +60,19 @@ if (process.argv.includes('--worker')) {
   const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
   while (emptyStreak < MAX_EMPTY_STREAK) {
-    const msg = q.receive()
+    const msg = await q.receive()
     if (msg === null) {
       emptyStreak++
       await sleep(1)
       continue
     }
     emptyStreak = 0
-    const ok = q.delete(msg.id, msg.received)
+    const ok = await q.delete(msg.id, msg.received)
     if (ok) {
       processed.push(msg.body)
     }
     // Yield after each message so the other process gets a fair shot at
-    // acquiring the SQLite lock. Without this, one process monopolizes
-    // the lock because better-sqlite3 calls are synchronous and very fast.
+    // acquiring the SQLite lock.
     await sleep(1)
   }
 
@@ -79,24 +87,32 @@ if (process.argv.includes('--worker')) {
 // Main process
 // ---------------------------------------------------------------------------
 async function main() {
-  const Database = (await import('better-sqlite3')).default
-  const { Queue } = await import('../src/index.js')
+  let Database: any
+  let driverClass: any
+  if (typeof process.versions.bun !== 'undefined') {
+    Database = (await import('bun:sqlite')).Database
+    driverClass = BunSqliteDriver
+  } else {
+    Database = (await import('better-sqlite3')).default
+    driverClass = BetterSqlite3Driver
+  }
 
   // Cleanup any leftover DB from a previous failed run
   cleanup()
 
-  console.log(`[main] Creating DB at ${DB_PATH}`)
+  console.log(`[main] Creating DB at ${DB_PATH} (runtime: ${typeof process.versions.bun !== 'undefined' ? 'bun' : 'node'})`)
   const db = new Database(DB_PATH)
-  const q = new Queue<number>(db, 'bench', {
+  const q = new Queue<number>(new driverClass(db), 'bench', {
     timeout: 30_000,
     maxReceive: 5,
   })
+  await q.init()
 
   // Enqueue N messages (body = sequential integer for easy verification)
   console.log(`[main] Sending ${N} messages...`)
   const batch = Array.from({ length: N }, (_, i) => ({ body: i }))
-  q.sendBatch(batch)
-  console.log(`[main] Queue size: ${q.size()}`)
+  await q.sendBatch(batch)
+  console.log(`[main] Queue size: ${await q.size()}`)
   db.close()
 
   // Spawn workers
@@ -124,7 +140,7 @@ async function main() {
     })
 
     let readyResolve: () => void
-    const ready = new Promise<void>((resolve) => { readyResolve = resolve })
+    const ready = new Promise<void>((resolve) => { readyResolve = resolve! })
 
     let doneResolve: (v: { workerId: number; processed: number[] }) => void
     let doneReject: (err: Error) => void
@@ -224,8 +240,9 @@ async function main() {
 
   // Verify queue is empty
   const db2 = new Database(DB_PATH)
-  const q2 = new Queue<number>(db2, 'bench', { timeout: 30_000, maxReceive: 5 })
-  const remaining = q2.size()
+  const q2 = new Queue<number>(new driverClass(db2), 'bench', { timeout: 30_000, maxReceive: 5 })
+  await q2.init()
+  const remaining = await q2.size()
   db2.close()
   assert(remaining === 0, `queue is empty after test (remaining: ${remaining})`)
 

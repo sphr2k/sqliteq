@@ -1,13 +1,5 @@
 export { Queue } from './queue.js'
 export { Processor } from './processor.js'
-export type {
-  Database,
-  Statement,
-  ID,
-  Message,
-  SendOptions,
-  QueueOptions,
-  QueueStats,
-  RequeueDeadLettersOptions,
-} from './types.js'
-export type { ProcessorOptions } from './processor.js'
+export { BetterSqlite3Driver, BunSqliteDriver, LibsqlDriver } from './drivers.js'
+export type { Database, Statement, ID, Message, SendOptions, QueueOptions, QueueDriver, DriverResultSet, QueueStats, RequeueDeadLettersOptions } from './types.js'
+export type { ProcessorOptions, IQueue } from './processor.js'
