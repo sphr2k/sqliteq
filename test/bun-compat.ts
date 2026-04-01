@@ -115,5 +115,53 @@ console.log('\n=== bun:sqlite compatibility ===\n')
   assert(q.size() === 0, 'Processor auto-deletes on success')
 }
 
+// 8. stats
+{
+  const q = new Queue(db as never, 'test8', { timeout: 50, maxReceive: 1 })
+  q.send('inflight')
+  const inflight = q.receive()!
+  q.extend(inflight.id, inflight.received, 500)
+  q.send('ready')
+  q.send('delayed', { delay: 200 })
+
+  const stats = q.stats()
+  assert(stats.total === 3, 'stats.total counts all messages')
+  assert(stats.ready === 1, 'stats.ready counts visible messages')
+  assert(stats.delayed === 1, 'stats.delayed counts scheduled messages')
+  assert(stats.inFlight === 1, 'stats.inFlight counts claimed messages')
+  assert(stats.dead === 0, 'stats.dead excludes non-dead messages')
+}
+
+// 9. DLQ operations
+{
+  const q = new Queue(db as never, 'test9', { timeout: 50, maxReceive: 1 })
+  q.send('dead-letter')
+  const old = q.receive()!
+  await Bun.sleep(100)
+
+  const ids = q.requeueDeadLetters()
+  assert(ids.length === 1, 'requeueDeadLetters returns new IDs')
+  assert(ids[0] !== old.id, 'requeued dead letter gets a new ID')
+  assert(q.deadLetters().length === 0, 'requeued dead letters are removed from DLQ')
+
+  q.send('purge-me')
+  q.receive()
+  await Bun.sleep(100)
+  assert(q.purgeDeadLetters() === 1, 'purgeDeadLetters removes dead letters')
+}
+
+// 10. receiveBatch
+{
+  const q = new Queue(db as never, 'test10', { timeout: 1_000 })
+  q.send('a')
+  q.send('b')
+  q.send('c')
+
+  const batch = q.receiveBatch(2)
+  assert(batch.length === 2, 'receiveBatch returns up to the requested limit')
+  assert(batch[0]!.body === 'a' && batch[1]!.body === 'b', 'receiveBatch preserves queue order')
+  assert(q.receive()!.body === 'c', 'receiveBatch leaves remaining messages available')
+}
+
 console.log(`\n${passed} passed, ${failed} failed\n`)
 process.exit(failed > 0 ? 1 : 0)

@@ -43,7 +43,10 @@ enabled by default.
 - Priority queues (higher priority messages are received first)
 - Delayed messages
 - Batch send in a single transaction
+- Batch receive
 - Dead letter detection (messages exceeding max receive count)
+- Queue stats (ready / delayed / in-flight / dead)
+- Dead letter requeue and purge operations
 - Typed messages with generics (`Queue<T>`)
 - Bring your own SQLite driver -- tested with better-sqlite3 and bun:sqlite
 
@@ -98,6 +101,12 @@ interface Message<T> {
 }
 ```
 
+### `queue.receiveBatch(limit): Message<T>[]`
+
+Atomically claim up to `limit` available messages. Returns fewer than requested
+when the queue runs dry. Claimed messages follow the same visibility timeout
+and fencing semantics as `receive()`.
+
 ### `queue.extend(id, received, delay): boolean`
 
 Extend a message's visibility timeout by `delay` ms. Returns `false` if the
@@ -111,6 +120,20 @@ Acknowledge and remove a message. Returns `false` on stale handle (safe no-op).
 
 Total messages in the queue (all states).
 
+### `queue.stats(): QueueStats`
+
+Get queue counts grouped by state:
+
+```ts
+interface QueueStats {
+  total: number
+  ready: number
+  delayed: number
+  inFlight: number
+  dead: number
+}
+```
+
 ### `queue.purge(): number`
 
 Delete all messages. Returns the count removed.
@@ -119,6 +142,20 @@ Delete all messages. Returns the count removed.
 
 Get messages that exceeded `maxReceive`. These will never be delivered again
 and should be inspected or moved.
+
+### `queue.requeueDeadLetters(options?): string[]`
+
+Requeue all current dead letters as fresh messages and return their new IDs.
+Requeued messages preserve body and priority, optionally apply a new delay, and
+always get new IDs so stale handles from previous deliveries stay invalid.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `delay` | `number` | `0` | Delay in ms before requeued messages become visible |
+
+### `queue.purgeDeadLetters(): number`
+
+Delete all current dead letters. Returns the count removed.
 
 ### `new Processor<T>(queue, options)`
 

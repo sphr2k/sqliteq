@@ -1,4 +1,12 @@
-import type { Database, ID, Message, SendOptions, QueueOptions } from './types.js'
+import type {
+  Database,
+  ID,
+  Message,
+  QueueOptions,
+  QueueStats,
+  RequeueDeadLettersOptions,
+  SendOptions,
+} from './types.js'
 
 const SCHEMA = `
 create table if not exists sqliteq (
@@ -45,9 +53,37 @@ const SQL_DELETE = `delete from sqliteq where queue = ? and id = ? and received 
 
 const SQL_SIZE = `select count(*) as c from sqliteq where queue = ?`
 
+const SQL_STATS = `
+  select
+    count(*) as total,
+    sum(case when received < ? and ? >= timeout then 1 else 0 end) as ready,
+    sum(case when received = 0 and ? < timeout then 1 else 0 end) as delayed,
+    sum(case when received > 0 and ? < timeout then 1 else 0 end) as in_flight,
+    sum(case when received >= ? and ? >= timeout then 1 else 0 end) as dead
+  from sqliteq
+  where queue = ?
+`
+
 const SQL_PURGE = `delete from sqliteq where queue = ?`
 
-const SQL_DEAD_LETTERS = `select id, body, received from sqliteq where queue = ? and received >= ? and ? >= timeout`
+const SQL_DEAD_LETTERS = `
+  select id, body, received
+  from sqliteq
+  where queue = ? and received >= ? and ? >= timeout
+  order by created
+`
+
+const SQL_DEAD_LETTER_ROWS = `
+  select id, body, received, priority
+  from sqliteq
+  where queue = ? and received >= ? and ? >= timeout
+  order by created
+`
+
+const SQL_PURGE_DEAD_LETTERS = `
+  delete from sqliteq
+  where queue = ? and received >= ? and ? >= timeout
+`
 
 function nowPlusMs(ms: number): string {
   return new Date(Date.now() + ms).toISOString()
@@ -55,6 +91,20 @@ function nowPlusMs(ms: number): string {
 
 function validateFinite(value: number, name: string): void {
   if (!Number.isFinite(value)) throw new Error(`${name} must be a finite number`)
+}
+
+function validatePositiveInteger(value: number, name: string): void {
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${name} must be an integer >= 1`)
+  }
+}
+
+function parseMessageBody<T>(body: string, messageId: string): T {
+  try {
+    return JSON.parse(body) as T
+  } catch (err) {
+    throw new Error(`Failed to parse body for message ${messageId}: ${err}`)
+  }
 }
 
 const DEFAULT_MAX_BODY_BYTES = 1_048_576 // 1MB
@@ -87,8 +137,11 @@ export class Queue<T = string> {
     extend: ReturnType<Database['prepare']>
     delete: ReturnType<Database['prepare']>
     size: ReturnType<Database['prepare']>
+    stats: ReturnType<Database['prepare']>
     purge: ReturnType<Database['prepare']>
     deadLetters: ReturnType<Database['prepare']>
+    deadLetterRows: ReturnType<Database['prepare']>
+    purgeDeadLetters: ReturnType<Database['prepare']>
   }
 
   constructor(db: Database, name: string, options?: QueueOptions) {
@@ -124,8 +177,11 @@ export class Queue<T = string> {
       extend: db.prepare(SQL_EXTEND),
       delete: db.prepare(SQL_DELETE),
       size: db.prepare(SQL_SIZE),
+      stats: db.prepare(SQL_STATS),
       purge: db.prepare(SQL_PURGE),
       deadLetters: db.prepare(SQL_DEAD_LETTERS),
+      deadLetterRows: db.prepare(SQL_DEAD_LETTER_ROWS),
+      purgeDeadLetters: db.prepare(SQL_PURGE_DEAD_LETTERS),
     }
   }
 
@@ -187,14 +243,25 @@ export class Queue<T = string> {
 
     if (!row) return null
 
-    let body: T
-    try {
-      body = JSON.parse(row.body) as T
-    } catch (err) {
-      throw new Error(`Failed to parse body for message ${row.id}: ${err}`)
-    }
+    return { id: row.id, body: parseMessageBody<T>(row.body, row.id), received: row.received }
+  }
 
-    return { id: row.id, body, received: row.received }
+  /**
+   * Atomically claim up to `limit` available messages.
+   * Returns fewer than requested when the queue runs dry.
+   */
+  receiveBatch(limit: number): Message<T>[] {
+    validatePositiveInteger(limit, 'limit')
+
+    return this.db.transaction(() => {
+      const messages: Message<T>[] = []
+      for (let i = 0; i < limit; i++) {
+        const msg = this.receive()
+        if (!msg) break
+        messages.push(msg)
+      }
+      return messages
+    })()
   }
 
   /**
@@ -229,9 +296,69 @@ export class Queue<T = string> {
     return row.c
   }
 
+  /** Queue counts grouped by operational state. */
+  stats(): QueueStats {
+    const now = new Date().toISOString()
+    const row = this.stmts.stats.get(
+      this.maxReceive,
+      now,
+      now,
+      now,
+      this.maxReceive,
+      now,
+      this.name,
+    ) as
+      | { total: number; ready: number | null; delayed: number | null; in_flight: number | null; dead: number | null }
+      | undefined
+
+    return {
+      total: row?.total ?? 0,
+      ready: row?.ready ?? 0,
+      delayed: row?.delayed ?? 0,
+      inFlight: row?.in_flight ?? 0,
+      dead: row?.dead ?? 0,
+    }
+  }
+
   /** Remove all messages from this queue. @returns Count of messages deleted. */
   purge(): number {
     return this.stmts.purge.run(this.name).changes
+  }
+
+  /**
+   * Requeue all currently dead-lettered messages as fresh messages.
+   * Requeued messages get new IDs so stale handles from previous deliveries remain invalid.
+   * @returns The new message IDs in FIFO order.
+   */
+  requeueDeadLetters(options?: RequeueDeadLettersOptions): ID[] {
+    const delay = options?.delay ?? 0
+    validateFinite(delay, 'delay')
+    if (delay < 0) throw new Error('delay cannot be negative')
+
+    return this.db.transaction(() => {
+      const now = new Date().toISOString()
+      const timeout = nowPlusMs(delay)
+      const rows = this.stmts.deadLetterRows.all(this.name, this.maxReceive, now) as
+        Array<{ id: string; body: string; received: number; priority: number }>
+
+      const ids: ID[] = []
+      for (const row of rows) {
+        const inserted = this.stmts.send.get(this.name, row.body, timeout, row.priority) as { id: string } | undefined
+        if (!inserted) throw new Error(`failed to requeue dead letter ${row.id}`)
+        ids.push(inserted.id)
+
+        const deleted = this.stmts.delete.run(this.name, row.id, row.received)
+        if (deleted.changes !== 1) throw new Error(`failed to delete dead letter ${row.id} after requeue`)
+      }
+
+      return ids
+    })()
+  }
+
+  /** Remove all currently dead-lettered messages. @returns Count of messages deleted. */
+  purgeDeadLetters(): number {
+    const now = new Date().toISOString()
+    return this.stmts.purgeDeadLetters.run(this.name, this.maxReceive, now).changes
   }
 
   /** Get messages that exceeded `maxReceive` and will never be delivered again. Inspect or purge these periodically. */
@@ -243,7 +370,7 @@ export class Queue<T = string> {
     return rows.map((r) => {
       let body: T
       try {
-        body = JSON.parse(r.body) as T
+        body = parseMessageBody<T>(r.body, r.id)
       } catch {
         body = r.body as T
       }

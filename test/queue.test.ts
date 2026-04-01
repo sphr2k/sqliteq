@@ -177,6 +177,46 @@ describe('Queue', () => {
     })
   })
 
+  describe('receiveBatch', () => {
+    it('returns up to limit messages in queue order', () => {
+      const q = new Queue(db, 'test')
+      q.send('low', { priority: 1 })
+      q.send('high', { priority: 10 })
+      q.send('mid')
+
+      const batch = q.receiveBatch(2)
+      expect(batch.map((msg) => msg.body)).toEqual(['high', 'low'])
+      expect(q.receive()!.body).toBe('mid')
+    })
+
+    it('returns fewer messages when the queue runs dry', () => {
+      const q = new Queue(db, 'test')
+      q.send('a')
+      q.send('b')
+
+      const batch = q.receiveBatch(5)
+      expect(batch).toHaveLength(2)
+      expect(batch.map((msg) => msg.body)).toEqual(['a', 'b'])
+    })
+
+    it('makes claimed messages invisible until timeout expires', () => {
+      const q = new Queue(db, 'test', { timeout: 60_000 })
+      q.send('a')
+      q.send('b')
+
+      const batch = q.receiveBatch(2)
+      expect(batch).toHaveLength(2)
+      expect(q.receive()).toBeNull()
+    })
+
+    it('validates limit', () => {
+      const q = new Queue(db, 'test')
+      expect(() => q.receiveBatch(0)).toThrow('limit must be an integer >= 1')
+      expect(() => q.receiveBatch(1.5)).toThrow('limit must be an integer >= 1')
+      expect(() => q.receiveBatch(Number.POSITIVE_INFINITY)).toThrow('limit must be an integer >= 1')
+    })
+  })
+
   describe('extend', () => {
     it('prevents redelivery while extended', async () => {
       const q = new Queue(db, 'test', { timeout: 50 })
@@ -298,6 +338,44 @@ describe('Queue', () => {
     })
   })
 
+  describe('stats', () => {
+    it('reports ready, delayed, in-flight, and dead counts', async () => {
+      const q = new Queue(db, 'test', { timeout: 20, maxReceive: 1 })
+
+      q.send('inflight')
+      const inflight = q.receive()!
+      expect(q.extend(inflight.id, inflight.received, 1_000)).toBe(true)
+
+      q.send('dead')
+      const dead = q.receive()!
+      expect(dead.body).toBe('dead')
+
+      await new Promise((r) => setTimeout(r, 30))
+
+      q.send('ready')
+      q.send('delayed', { delay: 100 })
+
+      expect(q.stats()).toEqual({
+        total: 4,
+        ready: 1,
+        delayed: 1,
+        inFlight: 1,
+        dead: 1,
+      })
+    })
+
+    it('returns zeroes for an empty queue', () => {
+      const q = new Queue(db, 'test')
+      expect(q.stats()).toEqual({
+        total: 0,
+        ready: 0,
+        delayed: 0,
+        inFlight: 0,
+        dead: 0,
+      })
+    })
+  })
+
   describe('deadLetters', () => {
     it('returns messages that exceeded maxReceive (and only those)', async () => {
       const q = new Queue(db, 'test', { timeout: 10, maxReceive: 1 })
@@ -313,6 +391,57 @@ describe('Queue', () => {
       expect(dead).toHaveLength(1)
       expect(dead[0].body).toBe('will-die')
       expect(dead[0].received).toBe(1)
+    })
+
+    it('requeues dead letters as fresh messages with new IDs', async () => {
+      const q = new Queue(db, 'test', { timeout: 10, maxReceive: 1 })
+      q.send('will-die')
+
+      const old = q.receive()!
+      await new Promise((r) => setTimeout(r, 20))
+
+      const ids = q.requeueDeadLetters()
+      expect(ids).toHaveLength(1)
+      expect(ids[0]).not.toBe(old.id)
+      expect(q.deadLetters()).toHaveLength(0)
+
+      const retried = q.receive()!
+      expect(retried.id).toBe(ids[0])
+      expect(retried.body).toBe('will-die')
+      expect(retried.received).toBe(1)
+      expect(q.delete(old.id, old.received)).toBe(false)
+    })
+
+    it('supports delayed requeue', async () => {
+      const q = new Queue(db, 'test', { timeout: 10, maxReceive: 1 })
+      q.send('later')
+      q.receive()
+      await new Promise((r) => setTimeout(r, 20))
+
+      expect(q.requeueDeadLetters({ delay: 50 })).toHaveLength(1)
+      expect(q.receive()).toBeNull()
+      await new Promise((r) => setTimeout(r, 70))
+      expect(q.receive()!.body).toBe('later')
+    })
+
+    it('purges dead letters only', async () => {
+      const q = new Queue(db, 'test', { timeout: 10, maxReceive: 1 })
+      q.send('dead')
+      q.send('ready')
+      q.send('delayed', { delay: 100 })
+
+      q.receive()
+      await new Promise((r) => setTimeout(r, 20))
+
+      expect(q.purgeDeadLetters()).toBe(1)
+      expect(q.stats()).toEqual({
+        total: 2,
+        ready: 1,
+        delayed: 1,
+        inFlight: 0,
+        dead: 0,
+      })
+      expect(q.receive()!.body).toBe('ready')
     })
   })
 
