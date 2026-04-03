@@ -32,14 +32,52 @@ const SQL_RECEIVE = `
 const SQL_EXTEND = `update sqliteq set timeout = ? where queue = ? and id = ? and received = ?`;
 const SQL_DELETE = `delete from sqliteq where queue = ? and id = ? and received = ?`;
 const SQL_SIZE = `select count(*) as c from sqliteq where queue = ?`;
+const SQL_STATS = `
+  select
+    count(*) as total,
+    sum(case when received < ? and ? >= timeout then 1 else 0 end) as ready,
+    sum(case when received = 0 and ? < timeout then 1 else 0 end) as delayed,
+    sum(case when received > 0 and ? < timeout then 1 else 0 end) as in_flight,
+    sum(case when received >= ? and ? >= timeout then 1 else 0 end) as dead
+  from sqliteq
+  where queue = ?
+`;
 const SQL_PURGE = `delete from sqliteq where queue = ?`;
-const SQL_DEAD_LETTERS = `select id, body, received from sqliteq where queue = ? and received >= ? and ? >= timeout`;
+const SQL_DEAD_LETTERS = `
+  select id, body, received
+  from sqliteq
+  where queue = ? and received >= ? and ? >= timeout
+  order by created
+`;
+const SQL_DEAD_LETTER_ROWS = `
+  select id, body, received, priority
+  from sqliteq
+  where queue = ? and received >= ? and ? >= timeout
+  order by created
+`;
+const SQL_PURGE_DEAD_LETTERS = `
+  delete from sqliteq
+  where queue = ? and received >= ? and ? >= timeout
+`;
 function nowPlusMs(ms) {
     return new Date(Date.now() + ms).toISOString();
 }
 function validateFinite(value, name) {
     if (!Number.isFinite(value))
         throw new Error(`${name} must be a finite number`);
+}
+function validatePositiveInteger(value, name) {
+    if (!Number.isInteger(value) || value < 1) {
+        throw new Error(`${name} must be an integer >= 1`);
+    }
+}
+function parseMessageBody(body, messageId) {
+    try {
+        return JSON.parse(body);
+    }
+    catch (err) {
+        throw new Error(`Failed to parse body for message ${messageId}: ${err}`);
+    }
 }
 const DEFAULT_MAX_BODY_BYTES = 1_048_576; // 1MB
 /**
@@ -171,14 +209,22 @@ export class Queue {
         if (res.rows.length === 0)
             return null;
         const row = res.rows[0];
-        let body;
-        try {
-            body = JSON.parse(row.body);
+        return { id: row.id, body: parseMessageBody(row.body, row.id), received: row.received };
+    }
+    /**
+     * Atomically claim up to `limit` available messages.
+     * Returns fewer than requested when the queue runs dry.
+     */
+    async receiveBatch(limit) {
+        validatePositiveInteger(limit, 'limit');
+        const messages = [];
+        for (let i = 0; i < limit; i++) {
+            const msg = await this.receive();
+            if (!msg)
+                break;
+            messages.push(msg);
         }
-        catch (err) {
-            throw new Error(`Failed to parse body for message ${row.id}: ${err}`);
-        }
-        return { id: row.id, body, received: row.received };
+        return messages;
     }
     /**
      * Extend a message's visibility timeout by `delay` ms from now.
@@ -210,9 +256,56 @@ export class Queue {
         const res = await this.driver.execute(SQL_SIZE, [this.name]);
         return Number(res.rows[0].c);
     }
+    /** Queue counts grouped by operational state. */
+    async stats() {
+        const now = new Date().toISOString();
+        const res = await this.driver.execute(SQL_STATS, [
+            this.maxReceive, now, now, now, this.maxReceive, now, this.name,
+        ]);
+        const row = res.rows[0];
+        return {
+            total: row?.total ?? 0,
+            ready: row?.ready ?? 0,
+            delayed: row?.delayed ?? 0,
+            inFlight: row?.in_flight ?? 0,
+            dead: row?.dead ?? 0,
+        };
+    }
     /** Remove all messages from this queue. @returns Count of messages deleted. */
     async purge() {
         const res = await this.driver.execute(SQL_PURGE, [this.name]);
+        return res.rowsAffected;
+    }
+    /**
+     * Requeue all currently dead-lettered messages as fresh messages.
+     * Requeued messages get new IDs so stale handles from previous deliveries remain invalid.
+     * @returns The new message IDs in FIFO order.
+     */
+    async requeueDeadLetters(options) {
+        const delay = options?.delay ?? 0;
+        validateFinite(delay, 'delay');
+        if (delay < 0)
+            throw new Error('delay cannot be negative');
+        const now = new Date().toISOString();
+        const timeout = nowPlusMs(delay);
+        const res = await this.driver.execute(SQL_DEAD_LETTER_ROWS, [this.name, this.maxReceive, now]);
+        const rows = res.rows;
+        const ids = [];
+        for (const row of rows) {
+            const inserted = await this.driver.execute(SQL_SEND, [this.name, row.body, timeout, row.priority]);
+            if (inserted.rows.length === 0)
+                throw new Error(`failed to requeue dead letter ${row.id}`);
+            ids.push(inserted.rows[0].id);
+            const deleted = await this.driver.execute(SQL_DELETE, [this.name, row.id, row.received]);
+            if (deleted.rowsAffected !== 1)
+                throw new Error(`failed to delete dead letter ${row.id} after requeue`);
+        }
+        return ids;
+    }
+    /** Remove all currently dead-lettered messages. @returns Count of messages deleted. */
+    async purgeDeadLetters() {
+        const now = new Date().toISOString();
+        const res = await this.driver.execute(SQL_PURGE_DEAD_LETTERS, [this.name, this.maxReceive, now]);
         return res.rowsAffected;
     }
     /** Get messages that exceeded `maxReceive` and will never be delivered again. Inspect or purge these periodically. */
@@ -222,7 +315,7 @@ export class Queue {
         return res.rows.map((r) => {
             let body;
             try {
-                body = JSON.parse(r.body);
+                body = parseMessageBody(r.body, r.id);
             }
             catch {
                 body = r.body;

@@ -1,4 +1,4 @@
-import type { ID, Message, SendOptions, QueueOptions, QueueDriver } from './types.js';
+import type { ID, Message, SendOptions, QueueOptions, QueueDriver, QueueStats, RequeueDeadLettersOptions } from './types.js';
 /**
  * A durable message queue backed by a single SQLite table.
  *
@@ -48,6 +48,11 @@ export declare class Queue<T = string> {
      */
     receive(): Promise<Message<T> | null>;
     /**
+     * Atomically claim up to `limit` available messages.
+     * Returns fewer than requested when the queue runs dry.
+     */
+    receiveBatch(limit: number): Promise<Message<T>[]>;
+    /**
      * Extend a message's visibility timeout by `delay` ms from now.
      * @param id - Message ID from {@link Message.id}.
      * @param received - Receive count from {@link Message.received} (used as a fencing token).
@@ -64,8 +69,18 @@ export declare class Queue<T = string> {
     delete(id: ID, received: number): Promise<boolean>;
     /** Number of messages in this queue (all states). */
     size(): Promise<number>;
+    /** Queue counts grouped by operational state. */
+    stats(): Promise<QueueStats>;
     /** Remove all messages from this queue. @returns Count of messages deleted. */
     purge(): Promise<number>;
+    /**
+     * Requeue all currently dead-lettered messages as fresh messages.
+     * Requeued messages get new IDs so stale handles from previous deliveries remain invalid.
+     * @returns The new message IDs in FIFO order.
+     */
+    requeueDeadLetters(options?: RequeueDeadLettersOptions): Promise<ID[]>;
+    /** Remove all currently dead-lettered messages. @returns Count of messages deleted. */
+    purgeDeadLetters(): Promise<number>;
     /** Get messages that exceeded `maxReceive` and will never be delivered again. Inspect or purge these periodically. */
     deadLetters(): Promise<Message<T>[]>;
 }

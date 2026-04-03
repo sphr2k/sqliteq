@@ -52,4 +52,20 @@ export interface QueueOptions {
     /** Max body size in bytes after JSON serialization (default: 1MB) */
     maxBodyBytes?: number;
 }
+export interface QueueStats {
+    /** Total messages in the queue across all states. */
+    total: number;
+    /** Messages available to receive now. */
+    ready: number;
+    /** Delayed messages that have never been received yet. */
+    delayed: number;
+    /** Messages currently claimed by a consumer (including the final allowed attempt). */
+    inFlight: number;
+    /** Messages that exceeded maxReceive and whose visibility timeout has expired. */
+    dead: number;
+}
+export interface RequeueDeadLettersOptions {
+    /** Optional delay in ms before the requeued messages become visible. */
+    delay?: number;
+}
 //# sourceMappingURL=types.d.ts.map
