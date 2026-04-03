@@ -15,12 +15,12 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
-    "prepare": "npm run build",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "bench": "tsx bench/run.ts",
-    "prepublishOnly": "npm run build"
+    "build": "bunx tsc",
+    "prepare": "bun run build",
+    "test": "bunx vitest run",
+    "test:watch": "bunx vitest",
+    "bench": "bun run bench/run.ts",
+    "prepublishOnly": "bun run build"
   },
   "repository": {
     "type": "git",
@@ -44,9 +44,10 @@
   "license": "MIT",
   "devDependencies": {
     "@libsql/client": "^0.17.2",
-    "@types/better-sqlite3": "^7.6.0",
-    "better-sqlite3": "^11.0.0",
-    "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.5.2",
+    "better-sqlite3": "^12.8.0",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.2"
   }
 }

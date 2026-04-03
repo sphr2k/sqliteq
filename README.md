@@ -7,7 +7,7 @@ Inspired by [goqite](https://github.com/maragudk/goqite). Zero dependencies.
 ## Install
 
 ```
-npm install @minnzen/sqliteq better-sqlite3
+bun add @minnzen/sqliteq better-sqlite3
 ```
 
 sqliteq uses an adapter pattern to support different SQLite backends with a unified asynchronous API.
